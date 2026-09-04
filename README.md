@@ -148,4 +148,4 @@ FAQ_DATA = {
 
 ## License
 
-MIT
+肇庆学院
