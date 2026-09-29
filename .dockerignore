@@ -1,0 +1,24 @@
+# 构建镜像时排除本地开发/密钥文件
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.json
+credentials.json
+.git
+.idea/
+.vscode/
+.gitignore
+Dockerfile
+docker-compose.yml
+README.md
+*.md
+*.log
+logs/

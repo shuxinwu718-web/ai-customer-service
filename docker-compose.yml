@@ -1,0 +1,37 @@
+# ============================================================================
+# AI 客服服务（Python FastAPI）独立编排
+#
+# 既可单独运行（配合宿主上的 MySQL/Redis/ES/后端），也可以被上层全栈编排
+# （Eshop 仓库 docker-compose.prod.yml 里的 ai 服务）复用本目录构建镜像。
+#
+# 运行方式（在本目录下）：
+#   docker compose up -d                 （默认连接宿主 127.0.0.1:8080 后端）
+#   BACKEND_BASE=http://eshop-app:8080 docker compose up -d   （指向后端服务名）
+#
+# 环境变量（见 .env.example）：
+#   DASHSCOPE_API_KEY   通义千问密钥（必填，否则返回「未配置 API Key」）
+#   MODEL_NAME          模型名，默认 qwen-turbo
+#   BACKEND_BASE        后端地址，独立运行时默认 http://127.0.0.1:8080
+# ============================================================================
+services:
+
+  ai:
+    build: .
+    container_name: eshop-ai
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # 容器内用后端服务名而非 localhost（见 tools.py 顶部 BACKEND_BASE）
+      - BACKEND_BASE=${BACKEND_BASE:-http://127.0.0.1:8080}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - MODEL_NAME=${MODEL_NAME:-qwen-turbo}
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/ai/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+networks:
+  default:
+    name: eshop-net

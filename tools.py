@@ -2,11 +2,12 @@
 # 通过 HTTP 代理调用 E-Shop 后端公开接口（后端零改动）
 
 import json
+import os
 
 import requests
 
-# E-Shop 后端地址
-BACKEND_BASE = "http://localhost:8080"
+# E-Shop 后端地址（Docker 内通过 BACKEND_BASE 环境变量指向后端服务名，如 http://eshop-app:8080）
+BACKEND_BASE = os.getenv("BACKEND_BASE", "http://localhost:8080")
 # 单次后端请求超时（秒）
 TIMEOUT = 5
 
