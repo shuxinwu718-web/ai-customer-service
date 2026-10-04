@@ -3,6 +3,8 @@
 
 import json
 import os
+import re
+from contextvars import ContextVar
 
 import requests
 
@@ -10,6 +12,19 @@ import requests
 BACKEND_BASE = os.getenv("BACKEND_BASE", "http://localhost:8080")
 # 单次后端请求超时（秒）
 TIMEOUT = 5
+
+# 本次请求携带的 JWT（每请求由 main.py 设置，用于查询我的订单/物流/退款，避免并发请求串身份）
+_current_token: "ContextVar[str]" = ContextVar("current_token", default="")
+
+
+def set_auth_token(token: str) -> None:
+    """设置本次请求的身份令牌"""
+    _current_token.set(token)
+
+
+def _auth_headers() -> dict:
+    token = _current_token.get()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 # ========== 工具定义（Function Calling Schema） ==========
 
@@ -99,14 +114,72 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_my_orders",
+            "description": "查询当前登录用户最近的订单列表（含订单状态、实付金额、商品、物流单号、退款单号 refundId）。"
+                           "当用户询问'我的订单'、'我买了什么'、订单状态，或想进一步查询物流/退款进度时，先调用本工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回订单数量，默认 5，最多 10",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tracking",
+            "description": "查询某订单或某运单的物流轨迹时间线（揽收/运输中/派送中/签收）。"
+                           "用户询问'物流/快递到哪了、发货了吗'时，先调用 get_my_orders 拿到 order_id 或 shipment_id，再调用本工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "订单 id（来自 get_my_orders 返回结果）",
+                    },
+                    "shipment_id": {
+                        "type": "integer",
+                        "description": "发货单 id（来自 get_my_orders 返回结果）",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_refund_progress",
+            "description": "查询某退款单的审核进度节点（商户审核/管理员审核/退款执行等）。"
+                           "用户询问'退款进度/退款到哪了/退了吗'时，先调用 get_my_orders 拿到 refundId，再调用本工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "refund_id": {
+                        "type": "integer",
+                        "description": "退款单 id（来自 get_my_orders 返回的 refundId）",
+                    },
+                },
+                "required": ["refund_id"],
+            },
+        },
+    },
 ]
 
 
 # ========== HTTP 工具函数 ==========
 
-def _http_get(path: str, params: dict) -> dict:
+def _http_get(path: str, params: dict, headers: "dict | None" = None) -> dict:
     """请求后端，返回 Result.data；失败抛异常"""
-    resp = requests.get(BACKEND_BASE + path, params=params, timeout=TIMEOUT)
+    resp = requests.get(BACKEND_BASE + path, params=params, timeout=TIMEOUT, headers=headers or {})
     resp.raise_for_status()
     body = resp.json()
     if body.get("code") != 200:
@@ -114,10 +187,27 @@ def _http_get(path: str, params: dict) -> dict:
     return body.get("data")
 
 
+def _clean_keyword(keyword) -> "str | None":
+    """白名单校验：仅允许中文/英文/数字/空格，截断 50 字符；非法返回 None"""
+    if not keyword:
+        return None
+    text = str(keyword).strip()[:50]
+    if not re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9\s]+", text):
+        return None
+    return text
+
+
+def _truncate(text: str, limit: int = 2000) -> str:
+    """超长截断，防止工具结果中内嵌指令被 LLM 当作指令执行"""
+    text = str(text)
+    return text[:limit] + "…（内容过长已截断）" if len(text) > limit else text
+
+
 # ========== 工具实现 ==========
 
 def search_products(keyword=None, min_price=None, max_price=None, sort_by="relevant", size=5):
     """商品搜索/推荐：ES 搜索接口"""
+    keyword = _clean_keyword(keyword)
     params = {
         "page": 0,
         "size": min(int(size or 5), 10),
@@ -229,12 +319,106 @@ def get_product_detail(product_id):
     return json.dumps(item, ensure_ascii=False)
 
 
+# ========== 带身份的工具：订单 / 物流 / 退款 ==========
+
+ORDER_STATUS_TEXT = {0: "待付款", 1: "已付款", 2: "已发货", 3: "已完成", 4: "已取消", 5: "退款中", 6: "已退款"}
+DELIVERY_STATUS_TEXT = {0: "待发货", 1: "已发货", 2: "已签收"}
+
+
+def get_my_orders(limit=5):
+    """查询当前登录用户最近订单（含物流单号与退款单号）"""
+    limit = min(int(limit or 5), 10)
+    try:
+        data = _http_get("/api/order/user/page", {"pageNum": 1, "pageSize": limit}, headers=_auth_headers()) or {}
+    except Exception as e:
+        return json.dumps({"error": "查询订单失败：请先登录（token 缺失/无效或已过期）"}, ensure_ascii=False)
+    records = data.get("records") or []
+    items = []
+    for o in records[:10]:
+        items.append({
+            "id": o.get("id"),
+            "orderNo": o.get("orderNo"),
+            "status": ORDER_STATUS_TEXT.get(o.get("status"), "未知"),
+            "payAmount": float(o.get("payAmount") or o.get("totalAmount") or 0),
+            "createTime": str(o.get("createTime"))[:19] if o.get("createTime") else None,
+            "products": [
+                {"name": it.get("productName"), "qty": it.get("quantity"),
+                 "price": float(it.get("productPrice") or 0)}
+                for it in (o.get("items") or [])
+            ],
+            "shipments": [
+                {"shippingName": s.get("shippingName"), "shippingNo": s.get("shippingNo"),
+                 "deliveryStatus": DELIVERY_STATUS_TEXT.get(s.get("deliveryStatus"), "未知")}
+                for s in (o.get("shipments") or [])
+            ],
+            "refundId": o.get("refundId"),
+            "refundStatus": ORDER_STATUS_TEXT.get(o.get("refundStatus")),
+        })
+    return json.dumps({"items": items}, ensure_ascii=False)
+
+
+def _parse_tracks(data) -> list:
+    """统一解析物流轨迹（接口返回单个 VO 或 VO 列表）"""
+    if isinstance(data, dict):
+        data = [data]
+    result = []
+    for t in data or []:
+        result.append({
+            "orderId": t.get("orderId"),
+            "shippingName": t.get("shippingName"),
+            "shippingNo": t.get("shippingNo"),
+            "deliveryStatus": DELIVERY_STATUS_TEXT.get(t.get("deliveryStatus"), "未知"),
+            "tracks": [
+                {"status": n.get("status"), "title": n.get("title"),
+                 "time": str(n.get("time"))[:19] if n.get("time") else None}
+                for n in (t.get("tracks") or [])
+            ],
+        })
+    return result
+
+
+def get_tracking(order_id=None, shipment_id=None):
+    """查询订单或运单的物流轨迹"""
+    try:
+        if order_id:
+            data = _http_get(f"/api/order/track/order/{int(order_id)}", {}, headers=_auth_headers())
+            return json.dumps({"items": _parse_tracks(data)}, ensure_ascii=False)
+        if shipment_id:
+            data = _http_get(f"/api/order/track/shipment/{int(shipment_id)}", {}, headers=_auth_headers())
+            return json.dumps({"items": _parse_tracks(data)}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"查询物流失败: {e}"}, ensure_ascii=False)
+    return json.dumps({"error": "请提供订单号(order_id)或运单号(shipment_id)"}, ensure_ascii=False)
+
+
+def get_refund_progress(refund_id):
+    """查询退款进度节点"""
+    try:
+        rid = int(refund_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "退款单号无效"}, ensure_ascii=False)
+    try:
+        data = _http_get(f"/api/order/refund/progress/{rid}", {}, headers=_auth_headers()) or []
+    except Exception as e:
+        return json.dumps({"error": f"查询退款进度失败: {e}"}, ensure_ascii=False)
+    items = [
+        {"node": n.get("nodeName"), "operator": n.get("operator"),
+         "remark": n.get("remark"),
+         "time": str(n.get("createTime"))[:19] if n.get("createTime") else None}
+        for n in data
+    ]
+    return json.dumps({"items": items}, ensure_ascii=False)
+
+
 # 工具名 → 执行函数
 TOOL_EXECUTOR = {
     "search_products": search_products,
     "get_seckill_sessions": get_seckill_sessions,
     "get_hot_products": get_hot_products,
     "get_product_detail": get_product_detail,
+    "get_my_orders": get_my_orders,
+    "get_tracking": get_tracking,
+    "get_refund_progress": get_refund_progress,
 }
 
 
@@ -244,6 +428,6 @@ def execute_tool(name: str, arguments: dict) -> str:
     if not func:
         return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
     try:
-        return func(**(arguments or {}))
+        return _truncate(func(**(arguments or {})))
     except Exception as e:
         return json.dumps({"error": f"工具执行失败: {e}"}, ensure_ascii=False)

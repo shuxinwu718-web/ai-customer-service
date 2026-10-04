@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 from dashscope import Generation
 
 from system_prompt import build_system_prompt
-from tools import TOOLS, execute_tool
+from tools import TOOLS, execute_tool, set_auth_token
+from intent import detect_intent, prefetch_data
 
 # 加载环境变量
 load_dotenv()
@@ -36,6 +37,7 @@ class HistoryItem(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: Optional[List[HistoryItem]] = None
+    token: str = ""  # 登录用户 JWT（用于查询我的订单/物流/退款）
 
 
 class ChatResponse(BaseModel):
@@ -66,16 +68,25 @@ def check_rate_limit(client_ip: str) -> bool:
 MAX_TOOL_ROUNDS = 3  # 单次提问最多工具调用轮数
 
 
-def chat_agent(message: str, history: Optional[List[HistoryItem]] = None) -> str:
-    """调用通义千问（系统提示词 + 多轮上下文 + Function Calling 工具）"""
+def chat_agent(message: str, history: Optional[List[HistoryItem]] = None, token: str = "") -> str:
+    """调用通义千问（系统提示词 + 多轮上下文 + 意图预取 + Function Calling 工具）"""
     api_key = os.getenv("DASHSCOPE_API_KEY")
     model = os.getenv("MODEL_NAME", "qwen-turbo")
 
     if not api_key:
         return "错误：未配置 API Key"
 
+    # 本次请求身份（订单/物流/退款工具使用）
+    set_auth_token(token or "")
+
+    # 进 LLM 前规则判定意图并预取真实数据（模型自选工具不可靠，命中后强制基于真实数据回答）
+    system_content = build_system_prompt()
+    injected = prefetch_data(detect_intent(message), message)
+    if injected:
+        system_content += "\n\n" + injected
+
     # 组装 messages：[system, ...历史对话(最多最近10轮), 当前问题]
-    messages = [{"role": "system", "content": build_system_prompt()}]
+    messages = [{"role": "system", "content": system_content}]
     if history:
         for item in history[-10:]:
             if item.role in ("user", "assistant") and item.content.strip():
@@ -103,7 +114,8 @@ def chat_agent(message: str, history: Optional[List[HistoryItem]] = None) -> str
         first_message = choices[0].get("message") or {} if choices else {}
         tool_calls = first_message.get("tool_calls") or []
         if tool_calls:
-            # 执行工具，把结果作为 tool 消息回传
+            # 先回传 assistant(tool_calls) 消息，再追加各工具结果（DashScope 多轮工具调用要求）
+            messages.append(first_message)
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 try:
@@ -145,7 +157,9 @@ async def chat(request: ChatRequest, req: Request):
     if not check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="提问太频繁，请稍后再试")
 
-    reply = chat_agent(request.message, request.history)
+    # 输入限长：超长自动截断
+    message = request.message.strip()[:200]
+    reply = chat_agent(message, request.history, request.token)
     return ChatResponse(reply=reply)
 
 
