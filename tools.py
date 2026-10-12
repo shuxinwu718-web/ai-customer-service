@@ -243,9 +243,11 @@ def get_seckill_sessions():
     if not data:
         return json.dumps({"items": []}, ensure_ascii=False)
 
+    # 兼容分页结构（data 为 Page 时取 records，total 兜底）；也兼容旧版数组结构
+    sessions = data.get("records") if isinstance(data, dict) else data
     status_text = {0: "未开始", 1: "进行中"}
     items = []
-    for s in data:
+    for s in sessions or []:
         items.append({
             "id": s.get("id"),
             "sessionName": s.get("sessionName"),
