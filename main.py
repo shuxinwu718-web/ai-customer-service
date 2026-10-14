@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -141,6 +142,93 @@ def chat_agent(message: str, history: Optional[List[HistoryItem]] = None, token:
     return "抱歉，暂时无法完成你的请求，请换个方式再试一次。"
 
 
+def chat_agent_stream(message: str, history: Optional[List[HistoryItem]] = None, token: str = ""):
+    """流式版：Function Calling 工具轮非流式判断，最终回答轮以增量流式输出（SSE）"""
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    model = os.getenv("MODEL_NAME", "qwen-turbo")
+
+    if not api_key:
+        yield "错误：未配置 API Key"
+        return
+
+    set_auth_token(token or "")
+
+    # 进 LLM 前规则判定意图并预取真实数据（与 chat_agent 保持一致）
+    system_content = build_system_prompt()
+    injected = prefetch_data(detect_intent(message), message)
+    if injected:
+        system_content += "\n\n" + injected
+
+    messages = [{"role": "system", "content": system_content}]
+    if history:
+        for item in history[-10:]:
+            if item.role in ("user", "assistant") and item.content.strip():
+                messages.append({"role": item.role, "content": item.content})
+    messages.append({"role": "user", "content": message})
+
+    # 1) 工具轮（非流式）：判断是否有 tool_calls，有则执行工具并回传结果
+    for _ in range(MAX_TOOL_ROUNDS):
+        try:
+            response = Generation.call(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                result_format="message",
+                api_key=api_key,
+            )
+        except Exception as e:
+            yield f"发生错误: {str(e)}"
+            return
+
+        if response.status_code != 200:
+            yield f"AI 调用失败: {response.message}"
+            return
+
+        output = response.output
+        choices = output.get("choices") or []
+        first_message = choices[0].get("message") or {} if choices else {}
+        tool_calls = first_message.get("tool_calls") or []
+        if not tool_calls:
+            break  # 无工具调用 → 最终回答轮，进入流式输出
+
+        messages.append(first_message)
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            try:
+                arguments = json.loads(fn.get("arguments")) if fn.get("arguments") else {}
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            result = execute_tool(fn.get("name"), arguments)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id"),
+                "content": result,
+            })
+    else:
+        yield "抱歉，暂时无法完成你的请求，请换个方式再试一次。"
+        return
+
+    # 2) 最终回答轮：incremental_output=True 时 output.text 为增量片段，逐块 yield
+    try:
+        stream_resp = Generation.call(
+            model=model,
+            messages=messages,
+            tools=TOOLS,
+            result_format="message",
+            api_key=api_key,
+            stream=True,
+            incremental_output=True,
+        )
+        for chunk in stream_resp:
+            if chunk.status_code != 200:
+                continue
+            text = chunk.output.get("text")
+            if text:
+                yield text
+    except Exception as e:
+        yield f"发生错误: {str(e)}"
+
+
 # ========== API 接口 ==========
 @app.get("/")
 async def root():
@@ -161,6 +249,31 @@ async def chat(request: ChatRequest, req: Request):
     message = request.message.strip()[:200]
     reply = chat_agent(message, request.history, request.token)
     return ChatResponse(reply=reply)
+
+
+@app.post("/ai/chat/stream")
+async def chat_stream(request: ChatRequest, req: Request):
+    """SSE 流式对话接口：data: {"delta": "..."} 增量块 + 结尾 data: {"done": true}"""
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    client_ip = req.client.host if req.client else "unknown"
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="提问太频繁，请稍后再试")
+
+    message = request.message.strip()[:200]
+
+    def event_gen():
+        for piece in chat_agent_stream(message, request.history, request.token):
+            payload = json.dumps({"delta": piece}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+        yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/ai/health")
