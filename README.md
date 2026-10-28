@@ -73,9 +73,9 @@ uvicorn main:app --reload --port 5000
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `OPENAI_API_KEY` | LLM API 密钥 | `sk-xxx...` |
-| `MODEL_NAME` | 使用的模型名称 | `gpt-4o-mini` |
-| `API_BASE_URL` | API 接口地址（可选） | `https://api.openai.com/v1` |
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥 | `sk-xxx...` |
+| `MODEL_NAME` | 使用的模型名称 | `deepseek-chat` |
+| `DEEPSEEK_BASE_URL` | API 接口地址（可选） | `https://api.deepseek.com` |
 
 ## API 接口
 

@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from dashscope import Generation
+from openai import OpenAI
 
 from system_prompt import build_system_prompt
 from tools import TOOLS, execute_tool, set_auth_token
@@ -65,168 +65,178 @@ def check_rate_limit(client_ip: str) -> bool:
     return True
 
 
-# ========== AI 调用函数（Agent 循环） ==========
+# ========== AI 调用（DeepSeek，OpenAI 兼容接口） ==========
 MAX_TOOL_ROUNDS = 3  # 单次提问最多工具调用轮数
 
 
-def chat_agent(message: str, history: Optional[List[HistoryItem]] = None, token: str = "") -> str:
-    """调用通义千问（系统提示词 + 多轮上下文 + 意图预取 + Function Calling 工具）"""
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    model = os.getenv("MODEL_NAME", "qwen-turbo")
-
+def build_client() -> Optional[OpenAI]:
+    """DeepSeek 走 OpenAI 兼容协议，默认地址 https://api.deepseek.com"""
+    api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        return "错误：未配置 API Key"
+        return None
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        timeout=60,
+    )
 
-    # 本次请求身份（订单/物流/退款工具使用）
+
+def model_name() -> str:
+    return os.getenv("MODEL_NAME", "deepseek-chat")
+
+
+def friendly_error(error: Exception) -> str:
+    """把供应商错误转成用户能看懂的提示，避免把密钥等细节抛给前端"""
+    text = str(error)
+    lowered = text.lower()
+    if "401" in text or "invalid_api_key" in lowered or "authentication" in lowered:
+        return "AI 密钥无效，请检查 DEEPSEEK_API_KEY 配置"
+    if "429" in text or "rate limit" in lowered:
+        return "请求过于频繁，请稍后再试"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "AI 服务响应超时，请稍后再试"
+    return text
+
+
+def tool_calls_payload(message) -> list:
+    """OpenAI 协议要求回传 assistant 消息里的 tool_calls 结构"""
+    return [
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        for tc in (message.tool_calls or [])
+    ]
+
+
+def run_tool_calls(message) -> list:
+    """执行模型请求的全部工具，返回可直接追加进 messages 的 tool 结果"""
+    results = []
+    for tc in message.tool_calls or []:
+        try:
+            arguments = json.loads(tc.function.arguments) if tc.function.arguments else {}
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        results.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": execute_tool(tc.function.name, arguments),
+            }
+        )
+    return results
+
+
+def build_messages(message: str, history: Optional[List[HistoryItem]], token: str) -> list:
+    """系统提示词 + 意图预取数据 + 最近 10 轮历史 + 当前问题"""
     set_auth_token(token or "")
 
-    # 进 LLM 前规则判定意图并预取真实数据（模型自选工具不可靠，命中后强制基于真实数据回答）
     system_content = build_system_prompt()
+    # 进 LLM 前规则判定意图并预取真实数据（模型自选工具不可靠，命中后强制基于真实数据回答）
     injected = prefetch_data(detect_intent(message), message)
     if injected:
         system_content += "\n\n" + injected
 
-    # 组装 messages：[system, ...历史对话(最多最近10轮), 当前问题]
     messages = [{"role": "system", "content": system_content}]
     if history:
         for item in history[-10:]:
             if item.role in ("user", "assistant") and item.content.strip():
                 messages.append({"role": item.role, "content": item.content})
     messages.append({"role": "user", "content": message})
+    return messages
 
-    # Function Calling 循环
+
+def chat_agent(message: str, history: Optional[List[HistoryItem]] = None, token: str = "") -> str:
+    """非流式：系统提示词 + 多轮上下文 + 意图预取 + Function Calling"""
+    client = build_client()
+    if not client:
+        return "错误：未配置 API Key"
+
+    messages = build_messages(message, history, token)
+
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = Generation.call(
-                model=model,
+            response = client.chat.completions.create(
+                model=model_name(),
                 messages=messages,
                 tools=TOOLS,
-                result_format="message",  # 必须：工具调用信息在 choices[0].message.tool_calls
-                api_key=api_key,
             )
         except Exception as e:
-            return f"发生错误: {str(e)}"
+            return f"AI 调用失败: {friendly_error(e)}"
 
-        if response.status_code != 200:
-            return f"AI 调用失败: {response.message}"
+        reply = response.choices[0].message if response.choices else None
+        if reply is None:
+            return "抱歉，暂时无法理解你的问题，请换个方式再试一次。"
 
-        output = response.output  # DictMixin（dict 子类）
-        choices = output.get("choices") or []
-        first_message = choices[0].get("message") or {} if choices else {}
-        tool_calls = first_message.get("tool_calls") or []
-        if tool_calls:
-            # 先回传 assistant(tool_calls) 消息，再追加各工具结果（DashScope 多轮工具调用要求）
-            messages.append(first_message)
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                try:
-                    arguments = json.loads(fn.get("arguments")) if fn.get("arguments") else {}
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
-                result = execute_tool(fn.get("name"), arguments)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "content": result,
-                })
+        if reply.tool_calls:
+            # 先回传 assistant(tool_calls)，再追加工具结果
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": tool_calls_payload(reply),
+                }
+            )
+            messages.extend(run_tool_calls(reply))
             continue
 
-        # 无工具调用 → 最终回复
-        text = output.get("text")
-        if not text:
-            text = first_message.get("content")
-        if text:
-            return text
-        return "抱歉，暂时无法理解你的问题，请换个方式再试一次。"
+        text = (reply.content or "").strip()
+        return text or "抱歉，暂时无法理解你的问题，请换个方式再试一次。"
 
     return "抱歉，暂时无法完成你的请求，请换个方式再试一次。"
 
 
 def chat_agent_stream(message: str, history: Optional[List[HistoryItem]] = None, token: str = ""):
-    """流式版：Function Calling 工具轮非流式判断，最终回答轮以增量流式输出（SSE）"""
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    model = os.getenv("MODEL_NAME", "qwen-turbo")
-
-    if not api_key:
+    """流式版：工具轮非流式判断，最终回答轮以增量流式输出（SSE）"""
+    client = build_client()
+    if not client:
         yield "错误：未配置 API Key"
         return
 
-    set_auth_token(token or "")
-
-    # 进 LLM 前规则判定意图并预取真实数据（与 chat_agent 保持一致）
-    system_content = build_system_prompt()
-    injected = prefetch_data(detect_intent(message), message)
-    if injected:
-        system_content += "\n\n" + injected
-
-    messages = [{"role": "system", "content": system_content}]
-    if history:
-        for item in history[-10:]:
-            if item.role in ("user", "assistant") and item.content.strip():
-                messages.append({"role": item.role, "content": item.content})
-    messages.append({"role": "user", "content": message})
+    messages = build_messages(message, history, token)
 
     # 1) 工具轮（非流式）：判断是否有 tool_calls，有则执行工具并回传结果
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = Generation.call(
-                model=model,
+            response = client.chat.completions.create(
+                model=model_name(),
                 messages=messages,
                 tools=TOOLS,
-                result_format="message",
-                api_key=api_key,
             )
         except Exception as e:
-            yield f"发生错误: {str(e)}"
+            yield f"AI 调用失败: {friendly_error(e)}"
             return
 
-        if response.status_code != 200:
-            yield f"AI 调用失败: {response.message}"
-            return
+        reply = response.choices[0].message if response.choices else None
+        if reply is None or not reply.tool_calls:
+            break
 
-        output = response.output
-        choices = output.get("choices") or []
-        first_message = choices[0].get("message") or {} if choices else {}
-        tool_calls = first_message.get("tool_calls") or []
-        if not tool_calls:
-            break  # 无工具调用 → 最终回答轮，进入流式输出
-
-        messages.append(first_message)
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            try:
-                arguments = json.loads(fn.get("arguments")) if fn.get("arguments") else {}
-            except (json.JSONDecodeError, TypeError):
-                arguments = {}
-            result = execute_tool(fn.get("name"), arguments)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id"),
-                "content": result,
-            })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": reply.content or "",
+                "tool_calls": tool_calls_payload(reply),
+            }
+        )
+        messages.extend(run_tool_calls(reply))
     else:
         yield "抱歉，暂时无法完成你的请求，请换个方式再试一次。"
         return
 
-    # 2) 最终回答轮：incremental_output=True 时 output.text 为增量片段，逐块 yield
+    # 2) 最终回答轮：流式输出。此处不再带 tools，避免流式轮又要请求工具
     try:
-        stream_resp = Generation.call(
-            model=model,
+        stream = client.chat.completions.create(
+            model=model_name(),
             messages=messages,
-            tools=TOOLS,
-            result_format="message",
-            api_key=api_key,
             stream=True,
-            incremental_output=True,
         )
-        for chunk in stream_resp:
-            if chunk.status_code != 200:
-                continue
-            text = chunk.output.get("text")
-            if text:
-                yield text
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                yield delta.content
     except Exception as e:
-        yield f"发生错误: {str(e)}"
+        yield f"AI 调用失败: {friendly_error(e)}"
 
 
 # ========== API 接口 ==========
